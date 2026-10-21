@@ -8,8 +8,9 @@
 //! - pressure → 0..1;
 //! - tilt: drivers report degrees (libinput, Xwayland: -64..63; wacom: -64..63 units of about a
 //!   degree), used as-is when the range fits in ±90, otherwise scaled to ±[`TILT_DEGREES`];
-//! - "Abs Rotary Z" (Art Pen barrel rotation) → 0..360;
-//! - "Abs Wheel" (Xwayland's label for the same axis on tablet tools) → 0..360.
+//! - "Abs Rotary Z" (Art Pen barrel rotation) → 0..360 from the valuator range;
+//! - "Abs Wheel" (Xwayland's label for the same axis on tablet tools) → degrees as
+//!   `raw / 5 − 90` (mod 360); raw `0` means no rotation was reported and leaves rotation at 0.
 //!
 //! The eraser is a separate device whose name says so ("… Pen eraser", "… Eraser (0x…)"), as
 //! GTK and Krita detect it. Raw events only carry the valuators that changed, so the last value
@@ -58,6 +59,8 @@ pub struct Axis {
     pub number: u16,
     pub min: f64,
     pub max: f64,
+    /// Xwayland labels barrel rotation "Abs Wheel" (5 units per degree, offset 90°).
+    pub abs_wheel_rotation: bool,
 }
 
 impl Axis {
@@ -83,6 +86,25 @@ impl Axis {
             AxisKind::Rotation => (unit * 360.0) as f32,
         }
     }
+}
+
+/// Xwayland and xf86-input-wacom send barrel rotation on "Abs Wheel" as
+/// `remainder(angle + 90, 360) * 5`. Raw `0` means the pen did not report rotation.
+pub fn map_abs_wheel_rotation(raw: f64) -> Option<f32> {
+    if !raw.is_finite() {
+        return Some(0.0);
+    }
+    if raw == 0.0 {
+        return None;
+    }
+    Some((raw / 5.0 - 90.0).rem_euclid(360.0) as f32)
+}
+
+/// XI2 delivers each raw event twice to `XIAllDevices` clients. The master copy has
+/// `deviceid` = master and `sourceid` = slave; the slave copy has both equal to the slave.
+#[inline]
+pub fn raw_event_is_slave_copy(deviceid: u16, sourceid: u16) -> bool {
+    deviceid == sourceid
 }
 
 /// A slave pointer device.
@@ -111,7 +133,8 @@ impl Device {
                 if kind == AxisKind::Rotation && label == "Abs Wheel" && !has_pressure {
                     return None;
                 }
-                Some(Axis { kind, number, min, max })
+                let abs_wheel_rotation = kind == AxisKind::Rotation && label == "Abs Wheel";
+                Some(Axis { kind, number, min, max, abs_wheel_rotation })
             })
             .collect();
         Self { id, name: name.to_string(), eraser: name.to_ascii_lowercase().contains("eraser"), axes }
@@ -138,8 +161,6 @@ pub fn valuators<'a>(mask: &'a [u32], values: &'a [f64]) -> impl Iterator<Item =
 pub struct State {
     devices: HashMap<u16, Device>,
     last: HashMap<u16, [Option<f32>; 4]>,
-    /// Slave device that last sent a tablet valuator event (tip or eraser).
-    active_tablet: Option<u16>,
 }
 
 impl State {
@@ -153,23 +174,17 @@ impl State {
         self.devices.get(&id)
     }
 
-    /// A raw motion or button event from the event's `sourceid` (the slave that moved) and its
-    /// changed valuators. Tablet devices give a sample. Other pointers clear the pen only on a
-    /// button event, or when no tablet is active; motion from `xwayland-pointer` while the pen is
-    /// down must not wipe pressure.
+    /// A raw motion or button event from slave device `id` and its changed valuators. Tablet
+    /// devices give a sample. Emulated pointers (e.g. `xwayland-pointer`) do not clear the pen
+    /// feed on motion; a mouse button still means `None`.
     pub fn handle(&mut self, id: u16, valuators: impl IntoIterator<Item = (u16, f64)>, is_button: bool) -> Update {
         let Some(dev) = self.devices.get(&id) else { return Update::Keep };
         if !dev.is_tablet() {
             if is_button {
-                self.active_tablet = None;
                 return Update::Set(None);
             }
-            if self.active_tablet.is_some() {
-                return Update::Keep;
-            }
-            return Update::Set(None);
+            return Update::Keep;
         }
-        self.active_tablet = Some(id);
         let last = self.last.entry(id).or_default();
         for (n, v) in valuators {
             for a in dev.axes.iter().filter(|a| a.number == n) {
@@ -179,8 +194,9 @@ impl State {
                     AxisKind::TiltY => 2,
                     AxisKind::Rotation => 3,
                 };
-                if let Some(s) = last.get_mut(slot) {
-                    *s = Some(a.map(v));
+                let mapped = if a.abs_wheel_rotation { map_abs_wheel_rotation(v) } else { Some(a.map(v)) };
+                if let (Some(s), Some(dest)) = (mapped, last.get_mut(slot)) {
+                    *dest = Some(s);
                 }
             }
         }
@@ -226,11 +242,30 @@ mod tests {
         Device::new(id, "Logitech USB Optical Mouse", [(0, "Rel X".to_string(), -1.0, -1.0), (1, "Rel Y".to_string(), -1.0, -1.0)])
     }
 
+    fn emulated_pointer(id: u16) -> Device {
+        Device::new(id, "xwayland-pointer", [(0, "Rel X".to_string(), -1.0, -1.0), (1, "Rel Y".to_string(), -1.0, -1.0)])
+    }
+
     fn sample(u: Update) -> Sample {
         match u {
             Update::Set(Some(s)) => s,
             other => panic!("expected a sample, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn raw_event_slave_copy_detection() {
+        assert!(!raw_event_is_slave_copy(2, 9));
+        assert!(raw_event_is_slave_copy(9, 9));
+    }
+
+    #[test]
+    fn abs_wheel_rotation_mapping() {
+        assert_eq!(map_abs_wheel_rotation(0.0), None);
+        assert!((map_abs_wheel_rotation(450.0).unwrap() - 0.0).abs() < 0.01);
+        assert!((map_abs_wheel_rotation(675.0).unwrap() - 45.0).abs() < 0.01);
+        assert!((map_abs_wheel_rotation(900.0).unwrap() - 90.0).abs() < 0.01);
+        assert_eq!(map_abs_wheel_rotation(f64::NAN), Some(0.0));
     }
 
     #[test]
@@ -256,8 +291,9 @@ mod tests {
     #[test]
     fn valuators_normalise_to_pressure_degrees_and_rotation() {
         let mut st = State::default();
-        st.set_devices([wacom(9, "Pen stylus"), wacom(10, "Pen eraser"), mouse(12)]);
-        assert_eq!(st.handle(12, [(0, 3.0)], false), Update::Set(None));
+        st.set_devices([wacom(9, "Pen stylus"), wacom(10, "Pen eraser"), mouse(12), emulated_pointer(14)]);
+        assert_eq!(st.handle(12, [(0, 3.0)], false), Update::Keep);
+        assert_eq!(st.handle(12, [(0, 1.0)], true), Update::Set(None));
         assert_eq!(st.handle(2, [(2, 3.0)], false), Update::Keep);
         let s = sample(st.handle(9, [(0, 100.0), (2, 32767.5), (3, -30.0), (4, 45.0), (5, 0.0)], false));
         assert_eq!(s.pressure, 0.5);
@@ -272,8 +308,8 @@ mod tests {
         assert!(s.eraser && s.pressure == 0.0 && s.tilt_x == 0.0);
         // Xwayland also moves xwayland-pointer while the pen is down: keep the pen sample.
         let _ = sample(st.handle(9, [(2, 40000.0)], false));
-        assert_eq!(st.handle(12, [(0, 3.0)], false), Update::Keep);
-        assert_eq!(st.handle(12, [(0, 1.0)], true), Update::Set(None));
+        assert_eq!(st.handle(14, [(0, 3.0)], false), Update::Keep);
+        assert_eq!(st.handle(14, [(0, 1.0)], true), Update::Set(None));
     }
 
     #[test]
@@ -324,7 +360,9 @@ mod tests {
         let mut st = State::default();
         st.set_devices([dev]);
         let s = sample(st.handle(11, [(5, 0.0)], false));
-        assert!((s.rotation - 180.0).abs() < 0.2);
+        assert!(s.rotation.abs() < 0.01);
+        let s = sample(st.handle(11, [(5, 900.0)], false));
+        assert!((s.rotation - 90.0).abs() < 0.2);
     }
 
     #[test]

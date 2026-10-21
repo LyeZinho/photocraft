@@ -10,8 +10,9 @@
 //! current, and maps them with [`crate::xi`].
 //!
 //! Raw events don't say which window the pen is over. That's fine for pressure: the UI only uses
-//! the sample while its own canvas receives pointer events. Valuators are read from the event's
-//! `sourceid` (the slave device), not `deviceid` (the master pointer).
+//! the sample while its own canvas receives pointer events. With `XIAllDevices`, the server
+//! delivers each raw event twice (a master copy and a slave copy). Only the slave copy has
+//! `deviceid == sourceid`; that copy is processed and valuators are read from `deviceid`.
 
 use std::thread::JoinHandle;
 
@@ -21,7 +22,7 @@ use x11rb::protocol::xinput::{self, ConnectionExt as _, DeviceClassData, DeviceT
 use x11rb::protocol::xproto::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 
-use crate::xi::{Device, State, fp3232, valuators};
+use crate::xi::{Device, State, fp3232, raw_event_is_slave_copy, valuators};
 use crate::{Error, Sample, Update, deliver};
 
 /// `XIAllDevices`: select for every device, slaves included.
@@ -61,12 +62,20 @@ fn run(conn: &RustConnection, state: &mut State, callback: &dyn Fn(Option<Sample
     while let Ok(event) = conn.wait_for_event() {
         let update = match event {
             Event::XinputRawMotion(e) => {
-                let values: Vec<f64> = e.axisvalues.iter().map(|v| fp3232(v.integral, v.frac)).collect();
-                state.handle(e.sourceid, valuators(&e.valuator_mask, &values), false)
+                if !raw_event_is_slave_copy(e.deviceid, e.sourceid) {
+                    Update::Keep
+                } else {
+                    let values: Vec<f64> = e.axisvalues.iter().map(|v| fp3232(v.integral, v.frac)).collect();
+                    state.handle(e.deviceid, valuators(&e.valuator_mask, &values), false)
+                }
             }
             Event::XinputRawButtonPress(e) | Event::XinputRawButtonRelease(e) => {
-                let values: Vec<f64> = e.axisvalues.iter().map(|v| fp3232(v.integral, v.frac)).collect();
-                state.handle(e.sourceid, valuators(&e.valuator_mask, &values), true)
+                if !raw_event_is_slave_copy(e.deviceid, e.sourceid) {
+                    Update::Keep
+                } else {
+                    let values: Vec<f64> = e.axisvalues.iter().map(|v| fp3232(v.integral, v.frac)).collect();
+                    state.handle(e.deviceid, valuators(&e.valuator_mask, &values), true)
+                }
             }
             Event::XinputHierarchy(_) | Event::XinputDeviceChanged(_) => {
                 state.set_devices(query_devices(conn));
